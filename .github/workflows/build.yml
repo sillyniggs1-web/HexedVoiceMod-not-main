@@ -1,0 +1,76 @@
+name: build-hexedvoicemod
+on: [push, workflow_dispatch]
+jobs:
+  test:                       # engine tests on the runner (stand-in for RubberBand), ~20 s
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release naming check (no pre-release wording left outside CHANGELOG.md / the README upgrade section)
+        run: |
+          # the patterns are written with a bracket so this file does not match itself
+          PAT='\bb[e]ta\b|VoiceFX v[8]'
+          fail=0
+          if grep -rIniE "$PAT" . --exclude-dir=.git --exclude-dir=mod --exclude=CHANGELOG.md --exclude=README.md --exclude=fAwesome6_solid.lua; then fail=1; fi
+          # README.md: everything except the "Upgrading from ..." section (up to the next "## " heading)
+          awk '/^## Upgrading from/{skip=1; next} /^## /{skip=0} !skip' README.md > /tmp/README.checked.md
+          if grep -niE "$PAT" /tmp/README.checked.md; then fail=1; fi
+          if [ "$fail" = 1 ]; then
+            echo "::error::pre-release wording found (see lines above). Only CHANGELOG.md and the upgrade section of README.md may mention it."
+            exit 1
+          fi
+          echo "naming check passed"
+      - name: Fetch RNNoise v0.1.1 (BSD-3-Clause, not stored in this repo; optional)
+        id: rn
+        continue-on-error: true
+        run: |
+          mkdir -p jni/rnnoise-src
+          curl -fL https://codeload.github.com/xiph/rnnoise/tar.gz/refs/tags/v0.1.1 | tar xz --strip-components=1 -C jni/rnnoise-src
+          ls jni/rnnoise-src/src/denoise.c jni/rnnoise-src/src/rnn_data.c jni/rnnoise-src/include/rnnoise.h
+      - name: Build RNNoise for the host tests (plain C, no -ffast-math)
+        if: steps.rn.outcome == 'success'
+        run: |
+          mkdir -p rnobj
+          for f in denoise rnn rnn_data pitch kiss_fft celt_lpc; do gcc -c -O2 -DNDEBUG -fno-fast-math -Ijni/rnnoise-src/include -Ijni/rnnoise-src/src jni/rnnoise-src/src/$f.c -o rnobj/$f.o; done
+      - name: Host tests (RNNoise + RubberBand stand-in)
+        if: steps.rn.outcome == 'success'
+        run: |
+          g++ -std=c++17 -O2 -ffast-math -fno-finite-math-only -I test/fake -Ijni/rnnoise-src/include test/host_test.cpp rnobj/*.o -o host_test_rn
+          ./host_test_rn
+      - name: Host tests (RNNoise + Lite only)
+        if: steps.rn.outcome == 'success'
+        run: |
+          g++ -std=c++17 -O2 -ffast-math -fno-finite-math-only -DVFX_NO_RUBBERBAND -Ijni/rnnoise-src/include test/host_test.cpp rnobj/*.o -o host_test_rn_lite
+          ./host_test_rn_lite
+      - name: Host tests (no RNNoise, RubberBand stand-in)
+        run: |
+          g++ -std=c++17 -O2 -ffast-math -fno-finite-math-only -DVFX_NO_RNNOISE -I test/fake test/host_test.cpp -o host_test
+          ./host_test
+      - name: Host tests (no RNNoise, Lite only)
+        run: |
+          g++ -std=c++17 -O2 -ffast-math -fno-finite-math-only -DVFX_NO_RNNOISE -DVFX_NO_RUBBERBAND test/host_test.cpp -o host_test_lite
+          ./host_test_lite
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch RubberBand 4.0.0 (GPL-2.0+, not stored in this repo)
+        run: |
+          mkdir -p jni/rubberband-src
+          curl -fL https://codeload.github.com/breakfastquay/rubberband/tar.gz/refs/tags/v4.0.0 | tar xz --strip-components=1 -C jni/rubberband-src
+          ls jni/rubberband-src/single/RubberBandSingle.cpp jni/rubberband-src/rubberband/RubberBandLiveShifter.h
+      - name: Fetch RNNoise v0.1.1 (BSD-3-Clause, not stored in this repo; optional - the build works without it)
+        continue-on-error: true
+        run: |
+          mkdir -p jni/rnnoise-src
+          curl -fL https://codeload.github.com/xiph/rnnoise/tar.gz/refs/tags/v0.1.1 | tar xz --strip-components=1 -C jni/rnnoise-src
+          ls jni/rnnoise-src/src/denoise.c jni/rnnoise-src/src/rnn_data.c
+      - name: ndk-build (armeabi-v7a)
+        run: |
+          $ANDROID_NDK_HOME/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=jni/Android.mk NDK_APPLICATION_MK=jni/Application.mk -j2
+          file libs/armeabi-v7a/libHexedVoiceMod.so
+          readelf -d libs/armeabi-v7a/libHexedVoiceMod.so | grep NEEDED
+          nm -D --defined-only libs/armeabi-v7a/libHexedVoiceMod.so | grep -E '__GetModInfo|OnModLoad|OnModPreLoad|vc_api|vfx_'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HexedVoiceMod
+          path: libs/armeabi-v7a/libHexedVoiceMod.so
